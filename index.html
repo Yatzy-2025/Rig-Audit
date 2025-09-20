@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rig Audit App (Offline Persistent)</title>
+<script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
+<style>
+body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+select, input, textarea, button { margin: 5px; }
+table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+th, td { border: 1px solid #aaa; padding: 6px; text-align: left; vertical-align: top; }
+th { background: #333; color: white; position: sticky; top: 0; }
+tr.notAcceptable { background-color: #ffcccc; }
+tr.notInspected { background-color: #ffff99; }
+tr.notApplicable { background-color: #ffffff; }
+tr.acceptable { background-color: #ccffcc; }
+button { padding: 6px 10px; }
+textarea { resize: none; width: 100%; height: 100%; box-sizing: border-box; min-height:40px; }
+#paginationControls { margin-top: 10px; }
+#searchBox { margin-top: 10px; width: 300px; padding: 5px; }
+#summaryBox { font-weight:bold; color:#000; padding:8px; border-radius:6px; margin-bottom:10px; }
+#criticalitySettings { margin-bottom: 10px; }
+#criticalitySettings input { width: 50px; }
+</style>
+</head>
+<body>
+
+<h2>Rig Audit App (Offline Persistent)</h2>
+
+RIG:
+<select id="rigSelect" size="5"></select>
+
+<br><br>
+
+<label>Upload Excel (once):</label>
+<input type="file" id="fileUpload" accept=".xlsx,.xls" />
+<button onclick="importExcel()">Import Excel</button>
+<button onclick="exportJSON()">Export JSON</button>
+<input type="file" id="jsonImport" style="display:none;" onchange="importJSON(event)" />
+<button onclick="document.getElementById('jsonImport').click()">Import JSON</button>
+
+<br><br>
+
+<input type="text" id="searchBox" placeholder="Search any column..." oninput="applySearch()" />
+
+<label for="resultFilter">Filter by Result:</label>
+<select id="resultFilter" onchange="applyFilter()" style="margin-left:5px;">
+  <option value="">All</option>
+  <option value="Acceptable">Acceptable</option>
+  <option value="Not Acceptable">Not Acceptable</option>
+  <option value="Not Inspected">Not Inspected</option>
+  <option value="Not Applicable">Not Applicable</option>
+</select>
+
+<br><br>
+
+<div id="criticalitySettings">
+  <strong>Criticality Weights:</strong>
+  <label>Critical: <input type="number" id="weightCritical" value="7" min="0"></label>
+  <label>Major: <input type="number" id="weightMajor" value="5" min="0"></label>
+  <label>Minor: <input type="number" id="weightMinor" value="2" min="0"></label>
+  <button onclick="updateWeights()">Update</button>
+</div>
+
+<br>
+
+<button onclick="generateReport('Not Acceptable','pdf')">PDF (Not Acceptable)</button>
+<button onclick="generateReport('Not Acceptable','excel')">Excel (Not Acceptable)</button>
+<button onclick="generateReport('Not Inspected','pdf')">PDF (Not Inspected)</button>
+<button onclick="generateReport('Not Inspected','excel')">Excel (Not Inspected)</button>
+<button onclick="generateReport('Not Applicable','pdf')">PDF (Not Applicable)</button>
+<button onclick="generateReport('Not Applicable','excel')">Excel (Not Applicable)</button>
+
+<div id="summaryBox"></div>
+
+<table id="auditTable">
+  <thead><tr id="tableHead"></tr></thead>
+  <tbody></tbody>
+</table>
+
+<div id="paginationControls">
+  <button onclick="prevPage()">Prev</button>
+  <span id="pagination"></span>
+  <button onclick="nextPage()">Next</button>
+</div>
+
+<script>
+let db;
+let currentRig = 1;
+let pageSize = 50;
+let currentPage = 1;
+let searchQuery = "";
+let resultFilter = "";
+let rigHeaders = {};
+let criticalityWeights = { "Critical": 7, "Major": 5, "Minor": 2 };
+
+// ------------------ INITIALIZE INDEXEDDB ------------------
+function initDB() {
+  const request = indexedDB.open("RigAuditDB", 1);
+  request.onupgradeneeded = e => {
+    db = e.target.result;
+    if (!db.objectStoreNames.contains("rigs")) db.createObjectStore("rigs", { keyPath: "id", autoIncrement: true });
+  };
+  request.onsuccess = e => {
+    db = e.target.result;
+    populateRigSelect();
+    loadAuditFromDB();
+  };
+  request.onerror = e => console.error("DB error:", e.target.error);
+}
+
+// ------------------ RIG SELECTION ------------------
+function populateRigSelect() {
+  const rigSelect = document.getElementById('rigSelect');
+  rigSelect.innerHTML = '';
+  for (let i = 1; i <= 20; i++) {
+    const option = document.createElement('option');
+    option.value = i;
+    option.text = "Rig " + i;
+    rigSelect.add(option);
+  }
+  rigSelect.selectedIndex = 0;
+  rigSelect.onchange = () => { currentRig = parseInt(rigSelect.value); currentPage = 1; loadAuditFromDB(); };
+}
+
+// ------------------ SEARCH & FILTER ------------------
+function applySearch() { searchQuery = document.getElementById("searchBox").value.toLowerCase(); currentPage=1; loadAuditFromDB(); }
+function applyFilter() { resultFilter = document.getElementById("resultFilter").value; currentPage=1; loadAuditFromDB(); }
+
+// ------------------ UPDATE CRITICALITY WEIGHTS ------------------
+function updateWeights() {
+  criticalityWeights.Critical = parseInt(document.getElementById("weightCritical").value) || 0;
+  criticalityWeights.Major = parseInt(document.getElementById("weightMajor").value) || 0;
+  criticalityWeights.Minor = parseInt(document.getElementById("weightMinor").value) || 0;
+  loadAuditFromDB();
+}
+
+// ------------------ DATA HANDLING ------------------
+function saveRowToDB(row) {
+  const tx = db.transaction("rigs", "readwrite");
+  tx.objectStore("rigs").put(row);
+}
+
+function saveAllToDB(rows){
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("rigs","readwrite");
+    const store = tx.objectStore("rigs");
+    store.getAll().onsuccess = e => {
+      const rig = rows[0]?.rig;
+      e.target.result.filter(r => r.rig===rig).forEach(r => store.delete(r.id));
+      rows.forEach(r => store.add(r));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+}
+
+// ------------------ TABLE RENDER ------------------
+function renderTable(rigItems) {
+  const thead = document.getElementById("tableHead");
+  const tbody = document.getElementById('auditTable').querySelector('tbody');
+  tbody.innerHTML = '';
+  
+  if(rigItems.length > 0 && !rigHeaders[currentRig]){
+    rigHeaders[currentRig] = Object.keys(rigItems[0]).filter(k=>k!=="rig" && k!=="id");
+  }
+  const headers = rigHeaders[currentRig] || [];
+  thead.innerHTML = "";
+
+  headers.forEach(h => { 
+    const th = document.createElement("th"); 
+    th.textContent = h; 
+    if(h === "Tab Name") th.style.width = "150px";
+    if(h === "Module Name") th.style.width = "150px";
+    if(h === "Unique ID") th.style.width = "70px";
+    if(h === "Activity") th.style.width = "500px";
+    if(h === "Criticality") th.style.width = "100px";
+    if(h === "Result") th.style.width = "120px";
+    if(h === "Comments") th.style.width = "800px";
+    thead.appendChild(th); 
+  });
+
+  let filtered = rigItems;
+  if(searchQuery) filtered = filtered.filter(item => headers.some(h=>(item[h]||"").toString().toLowerCase().includes(searchQuery)));
+  if(resultFilter) filtered = filtered.filter(item=>item.Result===resultFilter);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length/pageSize));
+  if(currentPage>totalPages) currentPage=totalPages;
+
+  const start = (currentPage-1)*pageSize;
+  const end = start + pageSize;
+  const pageItems = filtered.slice(start,end);
+
+  pageItems.forEach(item => {
+    const tr = document.createElement('tr');
+    if(item.Result==='Not Acceptable') tr.classList.add('notAcceptable');
+    else if(item.Result==='Not Inspected') tr.classList.add('notInspected');
+    else if(item.Result==='Not Applicable') tr.classList.add('notApplicable');
+    else if(item.Result==='Acceptable') tr.classList.add('acceptable');
+
+    headers.forEach(h=>{
+      const td=document.createElement('td');
+      if(h==="Comments"){
+        const textarea=document.createElement('textarea');
+        textarea.value=item[h]||'';
+        textarea.oninput=e=>{item[h]=e.target.value; saveRowToDB(item);};
+        td.appendChild(textarea);
+      } else if(h==="Result"){
+        const select=document.createElement('select');
+        const options = ['Acceptable','Not Acceptable','Not Inspected','Not Applicable'];
+        if(!item[h] || item[h].trim()==="") item[h] = "Not Applicable";
+        options.forEach(opt=>{
+          const o=document.createElement('option'); 
+          o.value = opt; o.text = opt; 
+          if(opt===item[h]) o.selected=true; 
+          select.add(o);
+        });
+        select.onchange=e=>{ item[h]=e.target.value; saveRowToDB(item); renderTable(rigItems); };
+        td.appendChild(select);
+      } else td.textContent=item[h]||"";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("pagination").textContent = `Page ${currentPage} of ${totalPages}`;
+
+  const acceptCount = rigItems.filter(i=>i.Result==='Acceptable').length;
+  const notAcceptCount = rigItems.filter(i=>i.Result==='Not Acceptable').length;
+  const notInspectedCount = rigItems.filter(i=>i.Result==='Not Inspected').length;
+  const notApplicableCount = rigItems.filter(i=>i.Result==='Not Applicable').length;
+
+  const totalRelevant = acceptCount + notAcceptCount;
+  let penalty = 0;
+  rigItems.forEach(i=>{
+    if(i.Result==='Not Acceptable') penalty += (criticalityWeights[i.Criticality]||0);
+  });
+
+  let score = 0;
+  if(totalRelevant>0){
+    score = ((totalRelevant - (penalty/totalRelevant)) / totalRelevant) * 100;
+    if(score < 0) score = 0;
+    if(score > 100) score = 100;
+  }
+
+  const summaryBox = document.getElementById('summaryBox');
+  summaryBox.textContent = 
+    `Rig ${currentRig}: ${notAcceptCount} Not Acceptable, `+
+    `${notInspectedCount} Not Inspected, `+
+    `${notApplicableCount} Not Applicable, `+
+    `${rigItems.length} Total, `+
+    `Score: ${score.toFixed(1)}%`;
+
+  summaryBox.style.background = score>=80?'#ccffcc':score>=50?'#ffff99':'#ffcccc';
+}
+
+// ------------------ LOAD AUDIT ------------------
+function loadAuditFromDB() {
+  const tx = db.transaction("rigs", "readonly");
+  tx.objectStore("rigs").getAll().onsuccess = e => {
+    const allData = e.target.result;
+    const rigItems = allData.filter(r=>r.rig===currentRig).map(r=>({rig:currentRig,...r}));
+    renderTable(rigItems);
+  };
+}
+
+// ------------------ PAGINATION ------------------
+function prevPage(){ if(currentPage>1){currentPage--; loadAuditFromDB();} }
+function nextPage(){ currentPage++; loadAuditFromDB(); }
+
+// ------------------ EXCEL UPLOAD ------------------
+async function importExcel() {
+  const fileInput = document.getElementById('fileUpload');
+  const file = fileInput.files[0];
+  if(!file){ alert("Select an Excel file"); return; }
+
+  const reader = new FileReader();
+  reader.onload = async function(e){
+    const data = new Uint8Array(e.target.result);
+    const workbook = XLSX.read(data,{type:'array'});
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet,{header:1,defval:""});
+    if(rows.length<2){ alert("Excel is empty"); return; }
+
+    const headers = rows[0];
+    rigHeaders = {};
+    for(let i=1;i<=20;i++){ rigHeaders[i] = headers; }
+
+    const imported = rows.slice(1).map(r=>{
+      const obj = {};
+      headers.forEach((h,idx)=> obj[h] = r[idx] || "");
+      if(!obj["Result"] || obj["Result"].trim() === "") obj["Result"] = "Not Applicable";
+      return obj;
+    });
+
+    for(let i=1;i<=20;i++){
+      await saveAllToDB(imported.map(r=>({rig:i,...r})));
+    }
+
+    loadAuditFromDB();
+    alert("Excel uploaded successfully for all rigs!");
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ------------------ EXPORT/IMPORT JSON ------------------
+function exportJSON() {
+  const tx = db.transaction("rigs","readonly");
+  tx.objectStore("rigs").getAll().onsuccess = e=>{
+    const data = e.target.result;
+    const blob = new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download="rig_audit_data.json"; a.click();
+    URL.revokeObjectURL(url);
+  };
+}
+
+function importJSON(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e=>{
+    try {
+      const data = JSON.parse(e.target.result);
+      data.forEach(r=>{
+        if(!r.Result || r.Result.trim()==="") r.Result = "Not Applicable";
+        saveRowToDB(r);
+      });
+      loadAuditFromDB();
+      alert("JSON imported successfully!");
+    } catch(err){
+      alert("Invalid JSON file");
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ------------------ REPORT GENERATION ------------------
+function generateReport(filterResult, format) {
+  const tx = db.transaction("rigs", "readonly");
+  const store = tx.objectStore("rigs");
+
+  store.getAll().onsuccess = e => {
+    const allData = e.target.result;
+    const reportItems = allData.filter(
+      i => i.rig === currentRig && i.Result === filterResult
+    );
+
+    if (reportItems.length === 0) {
+      alert(`No ${filterResult} items`);
+      return;
+    }
+
+    // --- Prepare headers and rows ---
+    const headers = rigHeaders[currentRig] || [];
+    const rows = reportItems.map(r => headers.map(h => r[h] || ""));
+
+    // --- Calculate score ---
+    const acceptCount = reportItems.filter(i => i.Result === 'Acceptable').length;
+    const notAcceptCount = reportItems.filter(i => i.Result === 'Not Acceptable').length;
+    const totalRelevant = acceptCount + notAcceptCount;
+
+    let penalty = 0;
+    reportItems.forEach(i => {
+      if (i.Result === 'Not Acceptable') penalty += (criticalityWeights[i.Criticality] || 0);
+    });
+
+    let score = 0;
+    if (totalRelevant > 0) {
+      score = ((totalRelevant - (penalty / totalRelevant)) / totalRelevant) * 100;
+      score = Math.min(Math.max(score, 0), 100); // clamp 0–100
+    }
+
+    // --- Excel Export ---
+    if (format === 'excel') {
+      const ws_data = [[`Score: ${score.toFixed(1)}%`], [], headers, ...rows];
+      const ws = XLSX.utils.aoa_to_sheet(ws_data);
+
+      const colWidths = [
+        { wpx: 150 }, // Tab Name
+        { wpx: 150 }, // Module Name
+        { wpx: 70 },  // Unique ID
+        { wpx: 300 }, // Activity
+        { wpx: 100 }, // Criticality
+        { wpx: 120 }, // Result
+        { wpx: 500 }  // Comments
+      ];
+      ws['!cols'] = colWidths;
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Audit Report");
+      XLSX.writeFile(wb, `Rig${currentRig}_${filterResult.replace(/ /g,'')}Report.xlsx`);
+    }
+
+    // --- PDF Export with fixed column widths ---
+    if (format === 'pdf') {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      doc.setFontSize(14);
+      doc.text(`Rig ${currentRig} - ${filterResult} Audit Report`, 40, 40);
+      doc.text(`Score: ${score.toFixed(1)}%`, 40, 60);
+
+      const columnStyles = {
+        'Tab Name': { cellWidth: 50 },
+        'Module Name': { cellWidth: 70 },
+        'Unique ID': { cellWidth: 70 },
+        'Activity': { cellWidth: 200 },
+        'Criticality': { cellWidth: 100 },
+        'Result': { cellWidth: 120 },
+        'Comments': { cellWidth: 200 },
+      };
+
+      doc.autoTable({
+        head: [headers],
+        body: rows,
+        startY: 80,
+        styles: { fontSize: 8, overflow: 'linebreak' },
+        columnStyles: columnStyles
+      });
+
+      doc.save(`Rig${currentRig}_${filterResult.replace(/ /g,'')}Report.pdf`);
+    }
+  };
+}
+
+// ------------------ INITIALIZE ------------------
+initDB();
+</script>
+</body>
+</html>
